@@ -1,0 +1,10 @@
+# Cursor contexts
+memory_bank
+long-term-memory
+.serena
+
+# Local stuffs
+start_dev_docker.py
+start_dev.py
+test_api.py
+test_auth.py
