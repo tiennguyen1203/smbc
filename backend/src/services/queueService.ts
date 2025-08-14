@@ -9,6 +9,19 @@ interface VideoProcessingJob {
   userId: string;
 }
 
+interface ChunkProcessingJob {
+  sessionId: string;
+  chunkIndex: number;
+  chunkFilePath: string;
+  userId: string;
+  tempFilePath: string;
+}
+
+interface FileAssemblyJob {
+  sessionId: string;
+  userId: string;
+}
+
 class QueueService {
   private connection: any = null;
   private channel: amqp.Channel | null = null;
@@ -70,22 +83,56 @@ class QueueService {
   private async setupQueues() {
     if (!this.channel) return;
 
+    // Video processing queues
     const videoQueue = "video_processing";
-    const deadLetterQueue = "video_processing_dlq";
-    const retryQueue = "video_processing_retry";
+    const videoDeadLetterQueue = "video_processing_dlq";
+    const videoRetryQueue = "video_processing_retry";
 
+    // Chunk processing queues
+    const chunkQueue = "chunk_processing";
+    const chunkDeadLetterQueue = "chunk_processing_dlq";
+    const chunkRetryQueue = "chunk_processing_retry";
+
+    // File assembly queues
+    const assemblyQueue = "file_assembly";
+    const assemblyDeadLetterQueue = "file_assembly_dlq";
+    const assemblyRetryQueue = "file_assembly_retry";
+
+    // Setup video processing queues
     await this.channel.assertQueue(videoQueue, {
       durable: true,
       arguments: {
         "x-dead-letter-exchange": "",
-        "x-dead-letter-routing-key": deadLetterQueue
+        "x-dead-letter-routing-key": videoDeadLetterQueue
       }
     });
+    await this.channel.assertQueue(videoDeadLetterQueue, { durable: true });
+    await this.channel.assertQueue(videoRetryQueue, { durable: true });
 
-    await this.channel.assertQueue(deadLetterQueue, { durable: true });
-    await this.channel.assertQueue(retryQueue, { durable: true });
+    // Setup chunk processing queues (high priority, fast processing)
+    await this.channel.assertQueue(chunkQueue, {
+      durable: true,
+      arguments: {
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": chunkDeadLetterQueue,
+        "x-max-priority": 10 // High priority for fast chunk processing
+      }
+    });
+    await this.channel.assertQueue(chunkDeadLetterQueue, { durable: true });
+    await this.channel.assertQueue(chunkRetryQueue, { durable: true });
 
-    console.log("Queues setup completed");
+    // Setup file assembly queues
+    await this.channel.assertQueue(assemblyQueue, {
+      durable: true,
+      arguments: {
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": assemblyDeadLetterQueue
+      }
+    });
+    await this.channel.assertQueue(assemblyDeadLetterQueue, { durable: true });
+    await this.channel.assertQueue(assemblyRetryQueue, { durable: true });
+
+    console.log("All queues setup completed");
   }
 
   async publishVideoJob(job: VideoProcessingJob): Promise<boolean> {
@@ -116,6 +163,75 @@ class QueueService {
       }
     } catch (error) {
       console.error("Error publishing video job:", error);
+      return false;
+    }
+  }
+
+  async publishChunkJob(job: ChunkProcessingJob): Promise<boolean> {
+    if (!this.channel || !this.isConnected) {
+      console.error("Queue service not connected");
+      return false;
+    }
+
+    try {
+      const message = JSON.stringify(job);
+      const success = this.channel.sendToQueue(
+        "chunk_processing",
+        Buffer.from(message),
+        {
+          persistent: true,
+          priority: 8, // High priority for chunk processing
+          headers: {
+            retryCount: 0
+          }
+        }
+      );
+
+      if (success) {
+        console.log(
+          `Chunk processing job published for session: ${job.sessionId}, chunk: ${job.chunkIndex}`
+        );
+        return true;
+      } else {
+        console.error("Failed to publish chunk processing job");
+        return false;
+      }
+    } catch (error) {
+      console.error("Error publishing chunk job:", error);
+      return false;
+    }
+  }
+
+  async publishFileAssemblyJob(job: FileAssemblyJob): Promise<boolean> {
+    if (!this.channel || !this.isConnected) {
+      console.error("Queue service not connected");
+      return false;
+    }
+
+    try {
+      const message = JSON.stringify(job);
+      const success = this.channel.sendToQueue(
+        "file_assembly",
+        Buffer.from(message),
+        {
+          persistent: true,
+          headers: {
+            retryCount: 0
+          }
+        }
+      );
+
+      if (success) {
+        console.log(
+          `File assembly job published for session: ${job.sessionId}`
+        );
+        return true;
+      } else {
+        console.error("Failed to publish file assembly job");
+        return false;
+      }
+    } catch (error) {
+      console.error("Error publishing file assembly job:", error);
       return false;
     }
   }
@@ -287,6 +403,152 @@ class QueueService {
     }
   }
 
+  async consumeChunkJobs(
+    processor: (job: ChunkProcessingJob) => Promise<void>
+  ) {
+    if (!this.channel || !this.isConnected) {
+      console.error("Queue service not connected");
+      return;
+    }
+
+    try {
+      // Set prefetch to process chunks quickly but not overwhelm
+      await this.channel.prefetch(5);
+
+      await this.channel.consume("chunk_processing", async msg => {
+        if (!msg) return;
+
+        try {
+          const job: ChunkProcessingJob = JSON.parse(msg.content.toString());
+          console.log(
+            `Processing chunk job: ${job.sessionId}, chunk: ${job.chunkIndex}`
+          );
+
+          await processor(job);
+
+          this.channel?.ack(msg);
+          console.log(
+            `Chunk job completed: ${job.sessionId}, chunk: ${job.chunkIndex}`
+          );
+        } catch (error) {
+          console.error(
+            `Error processing chunk job ${msg.content.toString()}:`,
+            error
+          );
+
+          const retryCount = msg.properties.headers?.retryCount || 0;
+
+          if (retryCount < 3) {
+            const retryJob = { ...JSON.parse(msg.content.toString()) };
+
+            console.log(
+              `Retrying chunk job ${retryJob.sessionId}, chunk ${
+                retryJob.chunkIndex
+              }, attempt ${retryCount + 1}/3`
+            );
+
+            await this.channel?.sendToQueue(
+              "chunk_processing_retry",
+              Buffer.from(JSON.stringify(retryJob)),
+              {
+                persistent: true,
+                priority: 7, // Slightly lower priority for retries
+                headers: { retryCount: retryCount + 1 }
+              }
+            );
+
+            this.channel?.ack(msg);
+          } else {
+            console.log(
+              `Chunk job ${
+                JSON.parse(msg.content.toString()).sessionId
+              } exceeded retry limit, moving to DLQ`
+            );
+
+            await this.channel?.sendToQueue(
+              "chunk_processing_dlq",
+              msg.content,
+              { persistent: true }
+            );
+            this.channel?.ack(msg);
+          }
+        }
+      });
+
+      console.log("Chunk processing consumer started");
+    } catch (error) {
+      console.error("Error setting up chunk job consumer:", error);
+    }
+  }
+
+  async consumeFileAssemblyJobs(
+    processor: (job: FileAssemblyJob) => Promise<void>
+  ) {
+    if (!this.channel || !this.isConnected) {
+      console.error("Queue service not connected");
+      return;
+    }
+
+    try {
+      await this.channel.consume("file_assembly", async msg => {
+        if (!msg) return;
+
+        try {
+          const job: FileAssemblyJob = JSON.parse(msg.content.toString());
+          console.log(`Processing file assembly job: ${job.sessionId}`);
+
+          await processor(job);
+
+          this.channel?.ack(msg);
+          console.log(`File assembly job completed: ${job.sessionId}`);
+        } catch (error) {
+          console.error(
+            `Error processing file assembly job ${msg.content.toString()}:`,
+            error
+          );
+
+          const retryCount = msg.properties.headers?.retryCount || 0;
+
+          if (retryCount < 3) {
+            const retryJob = { ...JSON.parse(msg.content.toString()) };
+
+            console.log(
+              `Retrying file assembly job ${retryJob.sessionId}, attempt ${
+                retryCount + 1
+              }/3`
+            );
+
+            await this.channel?.sendToQueue(
+              "file_assembly_retry",
+              Buffer.from(JSON.stringify(retryJob)),
+              {
+                persistent: true,
+                headers: { retryCount: retryCount + 1 }
+              }
+            );
+
+            this.channel?.ack(msg);
+          } else {
+            console.log(
+              `File assembly job ${
+                JSON.parse(msg.content.toString()).sessionId
+              } exceeded retry limit, moving to DLQ`
+            );
+
+            await this.channel?.sendToQueue("file_assembly_dlq", msg.content, {
+              persistent: true
+            });
+            this.channel?.ack(msg);
+          }
+        }
+      });
+
+      console.log("File assembly consumer started");
+    } catch (error) {
+      console.error("Error setting up file assembly job consumer:", error);
+    }
+  }
+
   async close() {
     try {
       if (this.channel) {
@@ -308,24 +570,69 @@ class QueueService {
     }
 
     try {
+      // Video processing queues
       const videoQueue = await this.channel.assertQueue("video_processing");
-      const retryQueue = await this.channel.assertQueue(
+      const videoRetryQueue = await this.channel.assertQueue(
         "video_processing_retry"
       );
-      const dlqQueue = await this.channel.assertQueue("video_processing_dlq");
+      const videoDlqQueue = await this.channel.assertQueue(
+        "video_processing_dlq"
+      );
+
+      // Chunk processing queues
+      const chunkQueue = await this.channel.assertQueue("chunk_processing");
+      const chunkRetryQueue = await this.channel.assertQueue(
+        "chunk_processing_retry"
+      );
+      const chunkDlqQueue = await this.channel.assertQueue(
+        "chunk_processing_dlq"
+      );
+
+      // File assembly queues
+      const assemblyQueue = await this.channel.assertQueue("file_assembly");
+      const assemblyRetryQueue = await this.channel.assertQueue(
+        "file_assembly_retry"
+      );
+      const assemblyDlqQueue = await this.channel.assertQueue(
+        "file_assembly_dlq"
+      );
 
       return {
         video_processing: {
           messages: videoQueue.messageCount,
           consumers: videoQueue.consumerCount
         },
-        retry_queue: {
-          messages: retryQueue.messageCount,
-          consumers: retryQueue.consumerCount
+        video_retry_queue: {
+          messages: videoRetryQueue.messageCount,
+          consumers: videoRetryQueue.consumerCount
         },
-        dead_letter_queue: {
-          messages: dlqQueue.messageCount,
-          consumers: dlqQueue.consumerCount
+        video_dead_letter_queue: {
+          messages: videoDlqQueue.messageCount,
+          consumers: videoDlqQueue.consumerCount
+        },
+        chunk_processing: {
+          messages: chunkQueue.messageCount,
+          consumers: chunkQueue.consumerCount
+        },
+        chunk_retry_queue: {
+          messages: chunkRetryQueue.messageCount,
+          consumers: chunkRetryQueue.consumerCount
+        },
+        chunk_dead_letter_queue: {
+          messages: chunkDlqQueue.messageCount,
+          consumers: chunkDlqQueue.consumerCount
+        },
+        file_assembly: {
+          messages: assemblyQueue.messageCount,
+          consumers: assemblyQueue.consumerCount
+        },
+        assembly_retry_queue: {
+          messages: assemblyRetryQueue.messageCount,
+          consumers: assemblyRetryQueue.consumerCount
+        },
+        assembly_dead_letter_queue: {
+          messages: assemblyDlqQueue.messageCount,
+          consumers: assemblyDlqQueue.consumerCount
         },
         connection_status: this.isConnected ? "connected" : "disconnected"
       };
@@ -362,4 +669,5 @@ class QueueService {
   }
 }
 
+export { VideoProcessingJob, ChunkProcessingJob, FileAssemblyJob };
 export default new QueueService();

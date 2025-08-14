@@ -12,6 +12,8 @@ import { authRoutes } from "./routes/authRoutes";
 import uploadRoutes from "./routes/uploadRoutes";
 import queueService from "./services/queueService";
 import videoProcessingService from "./services/videoProcessingService";
+import chunkProcessingService from "./services/chunkProcessingService";
+import fileAssemblyService from "./services/fileAssemblyService";
 import path from "path";
 
 dotenv.config();
@@ -87,6 +89,7 @@ app.get("/stream/:filename", (req, res) => {
   const stat = require("fs").statSync(filePath);
   const fileSize = stat.size;
   const range = req.headers.range;
+  console.log("[DEBUG] ~ range:", range);
 
   if (range) {
     const parts = range.replace(/bytes=/, "").split("-");
@@ -142,14 +145,33 @@ const server = app.listen(PORT, async () => {
     const connected = await queueService.connectWithRetry();
 
     if (connected && queueService.isReady()) {
+      // Start video processing consumer
       await queueService.consumeVideoJobs(async job => {
         console.log(`Processing video job: ${job.videoId}`);
         await videoProcessingService.processVideo(job.videoId, job.filePath);
       });
       console.log("Video processing consumer started successfully");
+
+      // Start chunk processing consumer (high priority, fast processing)
+      await queueService.consumeChunkJobs(async job => {
+        console.log(
+          `Processing chunk job: ${job.sessionId}, chunk: ${job.chunkIndex}`
+        );
+        await chunkProcessingService.processChunk(job);
+      });
+      console.log("Chunk processing consumer started successfully");
+
+      // Start file assembly consumer
+      await queueService.consumeFileAssemblyJobs(async job => {
+        console.log(`Processing file assembly job: ${job.sessionId}`);
+        await fileAssemblyService.assembleFile(job);
+      });
+      console.log("File assembly consumer started successfully");
+
+      console.log("All queue consumers started successfully");
     } else {
       console.error(
-        "Failed to start video processing consumer - queue service not ready"
+        "Failed to start queue consumers - queue service not ready"
       );
     }
   } catch (error) {

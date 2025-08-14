@@ -9,9 +9,7 @@ import {
   UploadSessionModel,
   CreateUploadSessionData
 } from "../models/UploadSession";
-import { VideoModel, CreateVideoData } from "../models/Video";
-import cacheService from "../services/cacheService";
-import queueService from "../services/queueService";
+import queueService, { ChunkProcessingJob } from "../services/queueService";
 
 const writeFile = promisify(fs.writeFile);
 const readFile = promisify(fs.readFile);
@@ -146,49 +144,45 @@ export class UploadController {
           return res.status(400).json({ error: "Invalid chunk index" });
         }
 
-        const chunksDir = path.join(__dirname, "../../chunks");
-        const tempFilePath = req.file.path;
-        const properFilename = `${sessionId}_chunk_${chunkIndexNum}`;
-        const properFilePath = path.join(chunksDir, properFilename);
-
-        try {
-          await rename(tempFilePath, properFilePath);
-        } catch (renameError) {
-          console.error(`Error renaming chunk file: ${renameError}`);
-          try {
-            await unlink(tempFilePath);
-          } catch (cleanupError) {
-            console.error(`Error cleaning up temp file: ${cleanupError}`);
-          }
-          return res
-            .status(500)
-            .json({ error: "Failed to process chunk file" });
-        }
-
-        const updatedSession = await UploadSessionModel.updateChunkUploaded(
+        // Queue the chunk for async processing instead of processing synchronously
+        const chunkJob: ChunkProcessingJob = {
           sessionId,
-          chunkIndexNum
-        );
-        if (!updatedSession) {
-          return res
-            .status(500)
-            .json({ error: "Failed to update upload session" });
-        }
-
-        if (updatedSession.status === "completed") {
-          await this.assembleFile(updatedSession);
-        }
-
-        res.json({
-          sessionId: updatedSession.id,
           chunkIndex: chunkIndexNum,
-          uploadedChunks: updatedSession.uploaded_chunks,
-          totalChunks: updatedSession.total_chunks,
-          status: updatedSession.status,
-          progress:
-            (updatedSession.uploaded_chunks.length /
-              updatedSession.total_chunks) *
-            100
+          chunkFilePath: path.join(
+            __dirname,
+            "../../chunks",
+            `${sessionId}_chunk_${chunkIndexNum}`
+          ),
+          userId,
+          tempFilePath: req.file.path
+        };
+
+        const jobQueued = await queueService.publishChunkJob(chunkJob);
+        if (!jobQueued) {
+          // If queue failed, clean up temp file and return error
+          try {
+            await unlink(req.file.path);
+          } catch (cleanupError) {
+            console.error(
+              `Error cleaning up temp file after queue failure: ${cleanupError}`
+            );
+          }
+          return res.status(500).json({
+            error: "Failed to queue chunk for processing. Please try again."
+          });
+        }
+
+        console.log(
+          `Chunk ${chunkIndexNum} queued for async processing (session: ${sessionId})`
+        );
+
+        // Return immediate response - client doesn't wait for processing
+        res.json({
+          sessionId,
+          chunkIndex: chunkIndexNum,
+          status: "queued",
+          message: "Chunk received and queued for processing",
+          queuePosition: "processing"
         });
       });
     } catch (error) {
@@ -354,74 +348,6 @@ export class UploadController {
     } catch (error) {
       console.error("Error listing upload sessions:", error);
       res.status(500).json({ error: "Internal server error" });
-    }
-  }
-
-  private async assembleFile(session: any) {
-    try {
-      const uploadsDir = path.join(__dirname, "../../uploads");
-      const chunksDir = path.join(__dirname, "../../chunks");
-      const finalFilePath = path.join(uploadsDir, session.filename);
-
-      try {
-        await access(uploadsDir);
-      } catch {
-        await mkdir(uploadsDir, { recursive: true });
-      }
-
-      const writeStream = fs.createWriteStream(finalFilePath);
-
-      for (let i = 0; i < session.total_chunks; i++) {
-        const chunkPath = path.join(chunksDir, `${session.id}_chunk_${i}`);
-        try {
-          const chunkData = await readFile(chunkPath);
-          writeStream.write(chunkData);
-          await unlink(chunkPath);
-        } catch (error) {
-          console.error(`Error reading chunk ${i}:`, error);
-          writeStream.destroy();
-          throw error;
-        }
-      }
-
-      writeStream.end();
-
-      await new Promise((resolve, reject) => {
-        writeStream.on("finish", () => {
-          resolve(true);
-        });
-        writeStream.on("error", reject);
-      });
-
-      const videoData: CreateVideoData = {
-        title: session.metadata?.title || session.original_filename,
-        description: session.metadata?.description || "",
-        filename: session.filename,
-        original_filename: session.original_filename,
-        file_path: finalFilePath.replace("app/", ""),
-        file_size: session.file_size,
-        mime_type: session.metadata?.mime_type || "video/mp4",
-        tags: session.metadata?.tags || [],
-        category: session.metadata?.category || "general",
-        user_id: session.user_id
-      };
-
-      const video = await VideoModel.create(videoData);
-
-      await queueService.publishVideoJob({
-        videoId: video.id,
-        filePath: finalFilePath,
-        userId: session.user_id
-      });
-
-      await cacheService.delPattern("videos:*");
-      await cacheService.delPattern("search:*");
-
-      console.log(`File assembled successfully: ${finalFilePath}`);
-    } catch (error) {
-      console.error("Error assembling file:", error);
-      await UploadSessionModel.updateStatus(session.id, "failed");
-      throw error;
     }
   }
 
